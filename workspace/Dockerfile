@@ -139,13 +139,30 @@ RUN set -eux; \
       apt-get update -yqq; \
       apt-get install -yqq \
         libzip-dev libpng-dev libjpeg-dev libwebp-dev libfreetype6-dev \
-        libicu-dev libpq-dev libmemcached-dev zlib1g-dev; \
+        libicu-dev libpq-dev libmemcached-dev zlib1g-dev \
+        libffi-dev libxslt-dev libsasl2-dev; \
       docker-php-ext-configure gd --prefix=/usr --with-jpeg --with-webp --with-freetype; \
       docker-php-ext-install -j"$(nproc)" \
         gd intl mysqli pdo_mysql pgsql pdo_pgsql zip bcmath opcache \
-        calendar exif gettext shmop sockets sysvmsg sysvsem sysvshm; \
-      echo '' | pecl -q install memcached; \
+        calendar exif gettext shmop sockets pcntl ffi xsl sysvmsg sysvsem sysvshm; \
+      echo '' | pecl -q install igbinary; \
+      docker-php-ext-enable igbinary; \
+      echo '' | pecl -q install msgpack; \
+      docker-php-ext-enable msgpack; \
+      # memcached is built from source instead of `pecl install`, to keep the serializers
+      # (igbinary, msgpack, json) and SASL the base image shipped it with.
+      curl -fsSL --http1.1 --retry 5 --retry-delay 2 --retry-all-errors \
+        -o /tmp/memcached.tgz https://pecl.php.net/get/memcached; \
+      mkdir -p /tmp/memcached-src; \
+      tar -xzf /tmp/memcached.tgz -C /tmp/memcached-src; \
+      cd /tmp/memcached-src/memcached-*; \
+      phpize; \
+      ./configure --enable-memcached-igbinary --enable-memcached-msgpack \
+        --enable-memcached-json --enable-memcached-sasl; \
+      make -j"$(nproc)"; \
+      make install; \
       docker-php-ext-enable memcached; \
+      rm -rf /tmp/memcached-src /tmp/memcached.tgz; \
     fi
 
 # always run apt update when start and after add new source list, then clean up at end.
@@ -1514,9 +1531,12 @@ ARG INSTALL_MEMCACHED=false
 
 RUN if [ ${INSTALL_MEMCACHED} = true ]; then \
   if [ -x /usr/local/bin/docker-php-ext-install ]; then \
-    apt-get -y install libmemcached-dev zlib1g-dev \
-    && echo '' | pecl -q install memcached \
-    && docker-php-ext-enable memcached \
+    # memcached may already come from the engine's base set (see above)
+    php -r 'exit(extension_loaded("memcached") ? 0 : 1);' || { \
+      apt-get -y install libmemcached-dev zlib1g-dev \
+      && echo '' | pecl -q install memcached \
+      && docker-php-ext-enable memcached; \
+    } \
   ;else \
     apt-get -y install php${LARADOCK_PHP_VERSION}-igbinary \
     && apt-get -y install php${LARADOCK_PHP_VERSION}-memcached \
