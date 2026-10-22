@@ -1419,12 +1419,16 @@ RUN if [ ${INSTALL_SYMFONY} = true ]; then \
 ARG INSTALL_PYTHON=false
 
 RUN if [ ${INSTALL_PYTHON} = true ]; then \
-  apt-get -y install python python-dev build-essential  \
-  && curl https://bootstrap.pypa.io/pip/2.7/get-pip.py -o get-pip.py  \
-  && python get-pip.py  \
+  apt-get -y install build-essential; \
+  # node-gyp of old native npm modules (node-sass and friends) only speaks Python 2;
+  # modern Ubuntu ships it as python2, older releases called it python.
+  if apt-get -y install python2 python2-dev; then PY2=python2; \
+  else apt-get -y install python python-dev && PY2=python; fi; \
+  curl https://bootstrap.pypa.io/pip/2.7/get-pip.py -o get-pip.py  \
+  && ${PY2} get-pip.py  \
   && rm get-pip.py  \
-  && python -m pip install --upgrade pip  \
-  && python -m pip install --upgrade virtualenv \
+  && ${PY2} -m pip install --upgrade pip  \
+  && ${PY2} -m pip install --upgrade virtualenv \
 ;fi
 
 ###########################################################################
@@ -1434,7 +1438,8 @@ RUN if [ ${INSTALL_PYTHON} = true ]; then \
 ARG INSTALL_PYTHON3=false
 
 RUN if [ ${INSTALL_PYTHON3} = true ]; then \
-  apt-get -y install python3 python3-dev build-essential  \
+  # python-is-python3 also provides the plain `python` command that build tools ask for
+  apt-get -y install python3 python3-dev python-is-python3 build-essential  \
   && curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py  \
   && python3 get-pip.py --break-system-packages \
   && rm get-pip.py  \
