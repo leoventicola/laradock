@@ -14,11 +14,33 @@
 
 ARG LARADOCK_PHP_VERSION
 ARG BASE_IMAGE_TAG_PREFIX=latest
+
+# The image the PHP engine (/usr/local) is taken from. It defaults to the base image
+# itself, so nothing is replaced. Set PHP_FPM_PHP_ENGINE_IMAGE in .env to run another
+# PHP build instead, e.g. ghcr.io/mpyw/php-eol-cve-2026-109618-109619:7.4-fpm, which
+# backports the CVE-2026-109618/CVE-2026-109619 fix to PHP 7.4. It must be a
+# docker-library style image (same /usr/local layout) for the same PHP_VERSION.
+ARG PHP_ENGINE_IMAGE=laradock/php-fpm:${BASE_IMAGE_TAG_PREFIX}-${LARADOCK_PHP_VERSION}
+
+# Engine provider: only its /usr/local tree and its PHP sources (what
+# docker-php-ext-install builds extensions from) are used; the rest of the base
+# image below stays.
+FROM ${PHP_ENGINE_IMAGE} AS php-engine
+
+RUN set -eux; \
+    mkdir -p /engine-php-src; \
+    if [ -d /usr/src ]; then cp -a /usr/src/. /engine-php-src/; fi
+
 FROM laradock/php-fpm:${BASE_IMAGE_TAG_PREFIX}-${LARADOCK_PHP_VERSION}
 
 LABEL maintainer="Mahmoud Zalt <mahmoud@zalt.me>"
 
 ARG LARADOCK_PHP_VERSION
+
+# Swap in the engine from PHP_ENGINE_IMAGE (a no-op overlay when it is the base image
+# itself). Extensions the base image already built stay valid: same PHP API version.
+COPY --from=php-engine /usr/local /usr/local
+COPY --from=php-engine /engine-php-src /usr/src
 
 # Set Environment Variables
 ENV DEBIAN_FRONTEND noninteractive
@@ -33,30 +55,27 @@ RUN if [ ${CHANGE_SOURCE} = true ]; then \
     sed -i 's/security-cdn.debian.org/mirrors.tuna.tsinghua.edu.cn/' /etc/apt/sources.list \
 ;fi
 
-RUN if [ "$LARADOCK_PHP_VERSION" = "7.1" ] || [ ${LARADOCK_PHP_VERSION} = "7.2" ]; then \
+# Debian releases past their end of life (buster for PHP 7.1/7.2, bullseye for PHP
+# 7.3/7.4/8.0) leave deb.debian.org: the mirror stops serving their packages and every
+# apt-get below fails with 404s. They only keep their packages on archive.debian.org.
+RUN if [ "$LARADOCK_PHP_VERSION" = "7.1" ] || [ ${LARADOCK_PHP_VERSION} = "7.2" ] \
+      || [ ${LARADOCK_PHP_VERSION} = "7.3" ] || [ ${LARADOCK_PHP_VERSION} = "7.4" ] \
+      || [ ${LARADOCK_PHP_VERSION} = "8.0" ]; then \
     sed -i \
       -e 's|deb.debian.org|archive.debian.org|g' \
       -e 's|security.debian.org|archive.debian.org|g' \
-      -e '/buster-updates/d' \
+      -e '/-updates/d' \
       /etc/apt/sources.list; \
 fi
 
-# pecl.php.net downloads intermittently truncate on CI (Fastly/HTTP flakiness), breaking
-# `pecl install` with "unable to unpack". Wrap pecl once so every install retries after clearing
-# the partial-download cache; all pecl call sites below become resilient with no other changes.
+# pecl.php.net downloads intermittently truncate on CI (Fastly/HTTP flakiness) and its
+# REST metadata sometimes comes back broken ("does not have REST info xml available").
+# Wrap pecl once so every install retries and falls back to the package tarball: see
+# ./pecl-wrapper.sh. All pecl call sites below become resilient with no other changes.
+COPY ./pecl-wrapper.sh /tmp/pecl-wrapper.sh
 RUN PECL_BIN="$(command -v pecl)"; \
     mv "$PECL_BIN" "${PECL_BIN}.real"; \
-    printf '%s\n' \
-      '#!/bin/sh' \
-      'i=1' \
-      'while :; do' \
-      "  \"${PECL_BIN}.real\" \"\$@\" && exit 0" \
-      '  [ "$i" -ge 5 ] && exit 1' \
-      '  echo "pecl: attempt $i failed, clearing cache and retrying..." >&2' \
-      '  rm -rf /tmp/pear/download/* /tmp/pear/temp/* 2>/dev/null || true' \
-      '  i=$((i+1)); sleep 3' \
-      'done' \
-      > "$PECL_BIN"; \
+    mv /tmp/pecl-wrapper.sh "$PECL_BIN"; \
     chmod +x "$PECL_BIN"
 
 # always run apt update when start and after add new source list, then clean up at end.

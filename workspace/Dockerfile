@@ -14,6 +14,26 @@
 
 ARG LARADOCK_PHP_VERSION
 ARG BASE_IMAGE_TAG_PREFIX=latest
+
+# The image the PHP engine (/usr/local) is taken from. It defaults to the base image
+# itself, so nothing is replaced. Set WORKSPACE_PHP_ENGINE_IMAGE in .env to run another
+# PHP build instead, e.g. ghcr.io/mpyw/php-eol-cve-2026-109618-109619:7.4-cli, which
+# backports the CVE-2026-109618/CVE-2026-109619 fix to PHP 7.4. It must be a
+# docker-library style image (PHP + toolchain in /usr/local) for the same PHP_VERSION.
+ARG PHP_ENGINE_IMAGE=laradock/workspace:${BASE_IMAGE_TAG_PREFIX}-${LARADOCK_PHP_VERSION}
+
+# Engine provider: only its /usr/local tree, its PHP sources (what docker-php-ext-install
+# builds extensions from) and the OpenSSL 1.1 runtime it may have been built against are
+# used; everything else in the base image below stays.
+FROM ${PHP_ENGINE_IMAGE} AS php-engine
+
+RUN set -eux; \
+    mkdir -p /engine-runtime-libs /engine-php-src; \
+    for lib in /usr/lib/*-linux-gnu/libssl.so.1.1 /usr/lib/*-linux-gnu/libcrypto.so.1.1; do \
+      if [ -e "${lib}" ]; then cp -a "${lib}" /engine-runtime-libs/; fi; \
+    done; \
+    if [ -d /usr/src ]; then cp -a /usr/src/. /engine-php-src/; fi
+
 FROM laradock/workspace:${BASE_IMAGE_TAG_PREFIX}-${LARADOCK_PHP_VERSION}
 
 LABEL maintainer="Mahmoud Zalt <mahmoud@zalt.me>"
@@ -25,6 +45,50 @@ ENV DEBIAN_FRONTEND noninteractive
 
 # Start as root
 USER root
+
+###########################################################################
+# PHP engine:
+###########################################################################
+#
+# Swap in the engine from PHP_ENGINE_IMAGE. The Ubuntu PHP packages of the base image
+# cannot load into it (they are built against another PHP build), so PHP extensions are
+# installed with the engine's own toolchain instead: the set the base image ships is
+# rebuilt in the block below, and the optional INSTALL_* steps fall back to apt packages
+# only when no engine was swapped in. So those steps keep working unchanged, the config
+# layout is bridged: /etc/php/<version>/cli, where they write their ini files, points at
+# the engine's own config directory.
+# This is a no-op when PHP_ENGINE_IMAGE is the base image itself (no engine to swap).
+#
+COPY --from=php-engine /usr/local /usr/local
+COPY --from=php-engine /engine-php-src /usr/src
+COPY --from=php-engine /engine-runtime-libs /tmp/engine-runtime-libs
+
+RUN set -eux; \
+    if [ -x /usr/local/bin/php ] && [ -x /usr/local/bin/docker-php-ext-install ]; then \
+      # An engine built on another distro (Debian bullseye ships OpenSSL 1.1) brings its
+      # own runtime; install it when this base (Ubuntu jammy ships OpenSSL 3) lacks it.
+      if ! ldconfig -p | grep -q 'libssl\.so\.1\.1'; then \
+        for lib in /tmp/engine-runtime-libs/*.so.1.1; do \
+          if [ -e "${lib}" ]; then cp -a "${lib}" /usr/local/lib/; fi; \
+        done; \
+        ldconfig; \
+      fi; \
+      # Make the plain php commands run the swapped-in engine as well.
+      ln -sf /usr/local/bin/php /usr/bin/php; \
+      ln -sf /usr/local/bin/php "/usr/bin/php${LARADOCK_PHP_VERSION}"; \
+      # Bridge /etc/php/<version>/cli (where everything below writes its ini files) onto
+      # the engine's config directory, keeping the base image's php.ini settings.
+      if [ -f "/etc/php/${LARADOCK_PHP_VERSION}/cli/php.ini" ] && [ ! -f /usr/local/etc/php/php.ini ]; then \
+        cp -a "/etc/php/${LARADOCK_PHP_VERSION}/cli/php.ini" /usr/local/etc/php/php.ini; \
+      fi; \
+      rm -rf "/etc/php/${LARADOCK_PHP_VERSION}/cli"; \
+      ln -s /usr/local/etc/php "/etc/php/${LARADOCK_PHP_VERSION}/cli"; \
+      rm -rf /tmp/engine-runtime-libs; \
+    fi
+
+# Config directory of the docker-library toolchain (docker-php-ext-install / -enable and
+# pecl write their ini files here; /etc/php/<version>/cli points here too, see above).
+ENV PHP_INI_DIR /usr/local/etc/php
 
 ###########################################################################
 # If you're in China, or you need to change sources, will be set CHANGE_SOURCE to true in .env.
@@ -51,23 +115,38 @@ ENV PGID ${PGID}
 ARG WORKSPACE_ALLOW_RELEASE_INFO_CHANGE=false
 ENV WORKSPACE_ALLOW_RELEASE_INFO_CHANGE ${WORKSPACE_ALLOW_RELEASE_INFO_CHANGE}
 
-# pecl.php.net downloads intermittently truncate on CI (Fastly/HTTP flakiness), breaking
-# `pecl install` with "unable to unpack". Wrap pecl once so every install retries after clearing
-# the partial-download cache; all pecl call sites below become resilient with no other changes.
+# pecl.php.net downloads intermittently truncate on CI (Fastly/HTTP flakiness) and its
+# REST metadata sometimes comes back broken ("does not have REST info xml available").
+# Wrap pecl once so every install retries and falls back to the package tarball: see
+# ./pecl-wrapper.sh. All pecl call sites below become resilient with no other changes.
+COPY ./pecl-wrapper.sh /tmp/pecl-wrapper.sh
 RUN PECL_BIN="$(command -v pecl)"; \
     mv "$PECL_BIN" "${PECL_BIN}.real"; \
-    printf '%s\n' \
-      '#!/bin/sh' \
-      'i=1' \
-      'while :; do' \
-      "  \"${PECL_BIN}.real\" \"\$@\" && exit 0" \
-      '  [ "$i" -ge 5 ] && exit 1' \
-      '  echo "pecl: attempt $i failed, clearing cache and retrying..." >&2' \
-      '  rm -rf /tmp/pear/download/* /tmp/pear/temp/* 2>/dev/null || true' \
-      '  i=$((i+1)); sleep 3' \
-      'done' \
-      > "$PECL_BIN"; \
+    mv /tmp/pecl-wrapper.sh "$PECL_BIN"; \
     chmod +x "$PECL_BIN"
+
+###########################################################################
+# Base image's PHP extensions:
+###########################################################################
+#
+# The base image ships these as Ubuntu PHP packages, and those cannot load into a
+# swapped-in engine: they are built against another PHP build. Rebuild the same set
+# with the engine's own toolchain so that switching PHP engines loses no extension.
+# This is a no-op when the engine is the base image's own PHP (see the block above).
+#
+RUN set -eux; \
+    if [ -x /usr/local/bin/php ] && [ -x /usr/local/bin/docker-php-ext-install ]; then \
+      apt-get update -yqq; \
+      apt-get install -yqq \
+        libzip-dev libpng-dev libjpeg-dev libwebp-dev libfreetype6-dev \
+        libicu-dev libpq-dev libmemcached-dev zlib1g-dev; \
+      docker-php-ext-configure gd --prefix=/usr --with-jpeg --with-webp --with-freetype; \
+      docker-php-ext-install -j"$(nproc)" \
+        gd intl mysqli pdo_mysql pgsql pdo_pgsql zip bcmath opcache \
+        calendar exif gettext shmop sockets sysvmsg sysvsem sysvshm; \
+      echo '' | pecl -q install memcached; \
+      docker-php-ext-enable memcached; \
+    fi
 
 # always run apt update when start and after add new source list, then clean up at end.
 RUN set -xe; \
@@ -100,10 +179,12 @@ RUN set -xe; \
       #
       # next lines are here because there is no auto build on dockerhub see https://github.com/laradock/laradock/pull/1903#issuecomment-463142846
       libzip-dev zip unzip \
-      # Install the zip extension
-      php${LARADOCK_PHP_VERSION}-zip \
       # nasm
       nasm && \
+      if [ ! -x /usr/local/bin/docker-php-ext-install ]; then \
+        # Install the zip extension (a swapped-in engine already has it, see above)
+        apt-get -yqq install php${LARADOCK_PHP_VERSION}-zip; \
+      fi && \
       php -m | grep -q 'zip'
 
 #
@@ -292,41 +373,71 @@ RUN set -eux; \
     # BZ2:
     ###########################################################################
     if [ ${INSTALL_BZ2} = true ]; then \
-      apt-get -yqq install php${LARADOCK_PHP_VERSION}-bz2; \
+      if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+        apt-get -yqq install libbz2-dev && docker-php-ext-install bz2; \
+      else \
+        apt-get -yqq install php${LARADOCK_PHP_VERSION}-bz2; \
+      fi; \
     fi; \
     ###########################################################################
     # GMP (GNU Multiple Precision):
     ###########################################################################
     if [ ${INSTALL_GMP} = true ]; then \
       # Install the PHP GMP extension
-      apt-get -yqq install php${LARADOCK_PHP_VERSION}-gmp; \
+      if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+        apt-get -yqq install libgmp-dev && docker-php-ext-install gmp; \
+      else \
+        apt-get -yqq install php${LARADOCK_PHP_VERSION}-gmp; \
+      fi; \
     fi; \
     ###########################################################################
     # GnuPG:
     ###########################################################################
     if [ ${INSTALL_GNUPG} = true ]; then \
+      if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+        pecl install gnupg && docker-php-ext-enable gnupg; \
+      else \
         apt-get -yqq install php${LARADOCK_PHP_VERSION}-gnupg; \
+      fi; \
     fi; \
     ###########################################################################
     # SSH2:
     ###########################################################################
     if [ ${INSTALL_SSH2} = true ]; then \
       # Install the PHP SSH2 extension
-      apt-get -yqq install libssh2-1-dev php${LARADOCK_PHP_VERSION}-ssh2; \
+      if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+        apt-get -yqq install libssh2-1-dev && \
+        if [ $(php -r "echo PHP_MAJOR_VERSION;") = "7" ] && [ $(php -r "echo PHP_MINOR_VERSION;") -lt 4 ]; then \
+          pecl install -a ssh2-0.13; \
+        else \
+          pecl install -a ssh2-1.3.1; \
+        fi && \
+        docker-php-ext-enable ssh2; \
+      else \
+        apt-get -yqq install libssh2-1-dev php${LARADOCK_PHP_VERSION}-ssh2; \
+      fi; \
     fi; \
     ###########################################################################
     # SOAP:
     ###########################################################################
     if [ ${INSTALL_SOAP} = true ]; then \
       # Install the PHP SOAP extension
-      apt-get -yqq install libxml2-dev php${LARADOCK_PHP_VERSION}-soap; \
+      if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+        apt-get -yqq install libxml2-dev && docker-php-ext-install soap; \
+      else \
+        apt-get -yqq install libxml2-dev php${LARADOCK_PHP_VERSION}-soap; \
+      fi; \
     fi; \
     ###########################################################################
     # XSL:
     ###########################################################################
     if [ ${INSTALL_XSL} = true ]; then \
       # Install the PHP XSL extension
-      apt-get -yqq install libxslt-dev php${LARADOCK_PHP_VERSION}-xsl; \
+      if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+        apt-get -yqq install libxslt-dev && docker-php-ext-install xsl; \
+      else \
+        apt-get -yqq install libxslt-dev php${LARADOCK_PHP_VERSION}-xsl; \
+      fi; \
     fi
 
 ###########################################################################
@@ -341,13 +452,24 @@ RUN set -eux; \
     # LDAP:
     ###########################################################################
     if [ ${INSTALL_LDAP} = true ]; then \
-        apt-get install -yqq libldap2-dev php${LARADOCK_PHP_VERSION}-ldap; \
+        if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+            apt-get install -yqq libldap2-dev && \
+            ARCH=$(arch) && \
+            docker-php-ext-configure ldap --with-libdir="lib/${ARCH}-linux-gnu/" && \
+            docker-php-ext-install ldap; \
+        else \
+            apt-get install -yqq libldap2-dev php${LARADOCK_PHP_VERSION}-ldap; \
+        fi; \
     fi; \
     ###########################################################################
     # SMB:
     ###########################################################################
     if [ ${INSTALL_SMB} = true ]; then \
-        apt-get install -yqq smbclient libsmbclient-dev php${LARADOCK_PHP_VERSION}-smbclient coreutils && \
+        if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+            apt-get install -yqq smbclient libsmbclient-dev coreutils; \
+        else \
+            apt-get install -yqq smbclient libsmbclient-dev php${LARADOCK_PHP_VERSION}-smbclient coreutils; \
+        fi && \
         if [ $(php -r "echo PHP_MAJOR_VERSION;") = "8" ]; then \
             pecl install smbclient; \
         else \
@@ -359,7 +481,13 @@ RUN set -eux; \
     # IMAP:
     ###########################################################################
     if [ ${INSTALL_IMAP} = true ]; then \
-        apt-get install -yqq php${LARADOCK_PHP_VERSION}-imap; \
+        if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+            apt-get install -yqq libc-client-dev libkrb5-dev && \
+            docker-php-ext-configure imap --with-kerberos --with-imap-ssl && \
+            docker-php-ext-install imap; \
+        else \
+            apt-get install -yqq php${LARADOCK_PHP_VERSION}-imap; \
+        fi; \
     fi; \
     ###########################################################################
     # Subversion:
@@ -380,7 +508,11 @@ ARG XDEBUG_PORT=9003
 RUN if [ ${INSTALL_XDEBUG} = true ]; then \
   # Install the xdebug extension
   # https://xdebug.org/docs/compat
-  apt-get install -yqq pkg-config php-xml php${LARADOCK_PHP_VERSION}-xml && \
+  if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+    apt-get install -yqq pkg-config; \
+  else \
+    apt-get install -yqq pkg-config php-xml php${LARADOCK_PHP_VERSION}-xml; \
+  fi && \
   if [ $(php -r "echo PHP_MAJOR_VERSION;") = "8" ] || { [ $(php -r "echo PHP_MAJOR_VERSION;") = "7" ] && { [ $(php -r "echo PHP_MINOR_VERSION;") = "4" ] || [ $(php -r "echo PHP_MINOR_VERSION;") = "3" ] ;} ;}; then \
     if [ $(php -r "echo PHP_MAJOR_VERSION;") = "8" ]; then \
       pecl install xdebug-3.5.0; \
@@ -445,8 +577,11 @@ USER root
 ARG INSTALL_PHPDBG=false
 
 RUN if [ ${INSTALL_PHPDBG} = true ]; then \
-    # Load the xdebug extension only with phpunit commands
-    apt-get install -y php${LARADOCK_PHP_VERSION}-phpdbg \
+    if [ ! -x /usr/local/bin/phpdbg ]; then \
+      # Load the xdebug extension only with phpunit commands
+      # (a swapped-in engine already ships phpdbg)
+      apt-get install -y php${LARADOCK_PHP_VERSION}-phpdbg \
+    ;fi \
 ;fi
 
 ###########################################################################
@@ -593,12 +728,18 @@ RUN if [ ${INSTALL_CASSANDRA} = true ]; then \
 ARG INSTALL_GEARMAN=false
 
 RUN if [ ${INSTALL_GEARMAN} = true ]; then \
-    add-apt-repository -y ppa:ondrej/pkg-gearman && \
-    apt-get update && \
-    if [ $(php -r "echo PHP_MAJOR_VERSION;") = "7" ]; then \
-      apt-get install php${LARADOCK_PHP_VERSION}-gearman -y  \
-    ; else \
-      apt-get install php-gearman -y  \
+    if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+      apt-get install -yqq libgearman-dev && \
+      pecl install gearman && \
+      docker-php-ext-enable gearman \
+    ;else \
+      add-apt-repository -y ppa:ondrej/pkg-gearman && \
+      apt-get update && \
+      if [ $(php -r "echo PHP_MAJOR_VERSION;") = "7" ]; then \
+        apt-get install php${LARADOCK_PHP_VERSION}-gearman -y  \
+      ; else \
+        apt-get install php-gearman -y  \
+      ;fi \
     ;fi \
 ;fi
 
@@ -609,8 +750,13 @@ RUN if [ ${INSTALL_GEARMAN} = true ]; then \
 ARG INSTALL_PHPREDIS=false
 
 RUN if [ ${INSTALL_PHPREDIS} = true ]; then \
-    apt-get update \
-    && apt-get install -yqq php${LARADOCK_PHP_VERSION}-redis \
+    if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+      pecl install redis && \
+      docker-php-ext-enable redis \
+    ;else \
+      apt-get update \
+      && apt-get install -yqq php${LARADOCK_PHP_VERSION}-redis \
+    ;fi \
 ;fi
 
 ###########################################################################
@@ -1367,8 +1513,14 @@ RUN if [ ${INSTALL_TERRAFORM} = true ]; then \
 ARG INSTALL_MEMCACHED=false
 
 RUN if [ ${INSTALL_MEMCACHED} = true ]; then \
-  apt-get -y install php${LARADOCK_PHP_VERSION}-igbinary \
-  && apt-get -y install php${LARADOCK_PHP_VERSION}-memcached \
+  if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+    apt-get -y install libmemcached-dev zlib1g-dev \
+    && echo '' | pecl -q install memcached \
+    && docker-php-ext-enable memcached \
+  ;else \
+    apt-get -y install php${LARADOCK_PHP_VERSION}-igbinary \
+    && apt-get -y install php${LARADOCK_PHP_VERSION}-memcached \
+  ;fi \
 ;fi
 
 ###########################################################################
@@ -1611,7 +1763,12 @@ RUN if [ ${INSTALL_WKHTMLTOPDF} = true ]; then \
 ARG INSTALL_MAILPARSE=false
 
 RUN if [ ${INSTALL_MAILPARSE} = true ]; then \
-    apt-get install -yqq php-mailparse \
+    if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+      pecl install mailparse && \
+      docker-php-ext-enable mailparse \
+    ;else \
+      apt-get install -yqq php-mailparse \
+    ;fi \
 ;fi
 
 ###########################################################################
@@ -1647,7 +1804,12 @@ RUN if [ ${INSTALL_GIT_PROMPT} = true ]; then \
 ARG INSTALL_XMLRPC=false
 
 RUN if [ ${INSTALL_XMLRPC} = true ]; then \
-    apt-get install -yqq php${LARADOCK_PHP_VERSION}-xmlrpc \
+    if [ -x /usr/local/bin/docker-php-ext-install ]; then \
+      pecl install xmlrpc && \
+      docker-php-ext-enable xmlrpc \
+    ;else \
+      apt-get install -yqq php${LARADOCK_PHP_VERSION}-xmlrpc \
+    ;fi \
 ;fi
 
 ###########################################################################
